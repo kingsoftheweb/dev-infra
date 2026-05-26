@@ -1,0 +1,36 @@
+# Shared edge proxy: one Caddy for all sites on this host.
+#
+# Uses caddy-docker-proxy (https://github.com/lucaslorentz/caddy-docker-proxy),
+# which watches the Docker socket for container labels and rebuilds the Caddy
+# config on the fly. Each per-site container declares:
+#   labels:
+#     caddy: <domain>
+#     caddy.reverse_proxy: "{{upstreams 5173}}"
+# and that's enough — Caddy obtains/renews the LE cert automatically and
+# transparently forwards WebSocket upgrades.
+
+services:
+  caddy:
+    image: lucaslorentz/caddy-docker-proxy:ci-alpine
+    container_name: edge-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Only containers on this network are eligible for routing.
+      CADDY_INGRESS_NETWORKS: edge
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - caddy_data:/data       # persists ACME account + issued certs
+      - caddy_config:/config
+    networks:
+      - edge
+    restart: unless-stopped
+
+networks:
+  edge:
+    name: edge
+
+volumes:
+  caddy_data:
+  caddy_config:

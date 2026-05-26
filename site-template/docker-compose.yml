@@ -1,0 +1,37 @@
+# Per-site dev stack — one container, fronted by the shared edge Caddy.
+#
+# The container:
+#   - mounts the entire /srv/sites/<slug> dir as /home/dev (so the dev user's
+#     home, .ssh, and the repo all live in one place — easy to reason about)
+#   - runs start.sh which keeps `vite dev` alive
+#   - exposes :5173, which the edge Caddy reverse-proxies based on labels
+
+services:
+  app:
+    build:
+      context: ./${REPO_NAME}
+      args:
+        DEV_UID: ${DEV_UID}
+    container_name: ${SLUG}
+    hostname: ${SLUG}
+    working_dir: /home/dev/app
+    volumes:
+      # Site dir → /home/dev. The /home/dev/app symlink is created at first
+      # start by start.sh (it points to the cloned repo subdir).
+      - .:/home/dev:rw
+    expose:
+      - "5173"
+    environment:
+      NODE_ENV: development
+      REPO_NAME: ${REPO_NAME}
+    networks:
+      - edge
+    labels:
+      caddy: ${DOMAIN}
+      caddy.reverse_proxy: "{{upstreams 5173}}"
+    restart: unless-stopped
+
+networks:
+  edge:
+    external: true
+    name: edge
