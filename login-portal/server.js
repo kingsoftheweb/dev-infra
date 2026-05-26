@@ -71,15 +71,24 @@ function clearCookie(res, name) {
   res.append('Set-Cookie', `${name}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
 }
 
-function getAuthorizedSites(email) {
+function readAccess() {
   try {
-    const data = JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf8'));
-    const sites = data?.users?.[email]?.sites;
-    return Array.isArray(sites) ? sites : [];
+    return JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf8'));
   } catch (e) {
     console.error('access list read failed:', e.message);
-    return [];
+    return { users: {}, sites: {} };
   }
+}
+
+function getAuthorizedSites(email) {
+  const data = readAccess();
+  const sites = data?.users?.[email]?.sites;
+  return Array.isArray(sites) ? sites : [];
+}
+
+function getSiteInfo(slug) {
+  const data = readAccess();
+  return data?.sites?.[slug] || {};
 }
 
 function escapeHtml(s) {
@@ -128,6 +137,10 @@ pre { background: rgba(0,0,0,0.05); padding: 12px; border-radius: 6px; overflow-
 .copy-btn:hover { border-color: #4285f4; }
 .footer { margin-top: 32px; font-size: 13px; }
 .footer a { color: #4285f4; text-decoration: none; }
+details { margin-top: 16px; }
+details summary { cursor: pointer; font-size: 14px; color: #4285f4; user-select: none; }
+details summary:hover { text-decoration: underline; }
+details ul { padding-left: 20px; }
 </style>
 </head><body>${body}</body></html>`;
 
@@ -162,35 +175,86 @@ const sitesHtml = (email, sites) => PAGE('Pick a site', `
   <p class="footer"><a href="/logout">Sign out</a></p>
 `);
 
-function tokenHtml({ email, site, token, expISO, mcpUrl }) {
+function tokenHtml({ email, site, token, expISO, mcpUrl, siteInfo }) {
+  const publicUrl = siteInfo.public_url ||
+    (siteInfo.domain ? `https://${siteInfo.domain}` : null);
+  const repo = siteInfo.repo || null;
+  const branch = siteInfo.branch || 'main';
+
+  // Build the message the user pastes into Claude. Self-contained: Claude
+  // sees this and has everything it needs to start working.
+  const claudeInstructions =
+`Connect me to the dev environment for ${site}.
+
+Add this MCP server (no other config needed):
+  Name: dev-shell
+  URL: ${mcpUrl}
+  Bearer token: ${token}
+
+Once connected, you have a Bash tool that runs commands inside a Linux
+container as user 'dev'. Default working directory: /home/dev/app.
+
+What you can assume:
+- Source code is at /home/dev/app${repo ? ` (clone of ${repo}, branch '${branch}')` : ''}
+- Vite dev server is running with HMR; saved file changes appear live at${publicUrl ? `
+  ${publicUrl}` : ' the public URL'}
+- Git is configured (deploy key, read-write): pull / commit / push all work
+- Container has Node 20, npm, git, curl, sudo (passwordless), bash
+- You can install more with: sudo apk add <package>
+- There is no local filesystem to edit — make all changes via Bash
+- Verify visual changes by refreshing${publicUrl ? ` ${publicUrl}` : ' the site URL'}
+
+When in doubt:
+- Explore: \`find . -type f | head\`, \`ls\`, \`cat README.md\`
+- Locate code: \`grep -r '<keyword>' src/\`
+- Check vite picked up an edit: \`docker logs ${site}\` (run from host via ssh
+  is needed; otherwise trust HMR and refresh the page)
+- Look at running processes: \`ps aux\`
+
+Start by reading the project README and showing me the directory tree.`;
+
   return PAGE(`Token: ${site}`, `
   <h1>Token for ${escapeHtml(site)}</h1>
   <p class="muted">Issued to ${escapeHtml(email)} · valid until ${escapeHtml(expISO)}</p>
 
   <div class="card">
-    <p><strong>1. Token (HS256 JWT)</strong></p>
+    <p><strong>Paste this into Claude</strong></p>
+    <p class="muted">Self-contained — Claude will know everything it needs.</p>
     <div class="token-box">
-      <pre id="token">${escapeHtml(token)}</pre>
-      <button class="copy-btn" onclick="copyTok()">Copy</button>
+      <pre id="instructions">${escapeHtml(claudeInstructions)}</pre>
+      <button class="copy-btn" onclick="copyText('instructions', this)">Copy all</button>
     </div>
-
-    <p><strong>2. Paste into Claude</strong></p>
-    <p>Tell Claude:</p>
-    <pre>Start development for ${escapeHtml(site)}.
-MCP URL: ${escapeHtml(mcpUrl)}
-Token: ${escapeHtml(token)}</pre>
-
-    <p>Or, in Claude Code Desktop, export the token in your shell and reload the session:</p>
-    <pre>export DEV_MCP_TOKEN=${escapeHtml(token)}</pre>
   </div>
 
-  <p><a class="btn-secondary btn" href="/sites">← Pick another site</a>
-     &nbsp;<a class="btn-secondary btn" href="/logout">Sign out</a></p>
+  <details>
+    <summary>Just the token (HS256 JWT)</summary>
+    <div class="token-box" style="margin-top:8px">
+      <pre id="token">${escapeHtml(token)}</pre>
+      <button class="copy-btn" onclick="copyText('token', this)">Copy</button>
+    </div>
+    <p class="muted">Or, in Claude Code Desktop, export this in your shell and reload the session:</p>
+    <pre>export DEV_MCP_TOKEN=${escapeHtml(token)}</pre>
+  </details>
+
+  <details>
+    <summary>Connection details</summary>
+    <ul class="muted" style="line-height:1.7">
+      <li>MCP URL: <code>${escapeHtml(mcpUrl)}</code></li>
+      ${publicUrl ? `<li>Public URL: <code>${escapeHtml(publicUrl)}</code></li>` : ''}
+      ${repo ? `<li>Repo: <code>${escapeHtml(repo)}</code> · branch <code>${escapeHtml(branch)}</code></li>` : ''}
+      <li>Valid until: <code>${escapeHtml(expISO)}</code></li>
+    </ul>
+  </details>
+
+  <p style="margin-top:24px">
+    <a class="btn-secondary btn" href="/sites">← Pick another site</a>
+    &nbsp;<a class="btn-secondary btn" href="/logout">Sign out</a>
+  </p>
 
   <script>
-    function copyTok() {
-      navigator.clipboard.writeText(document.getElementById('token').textContent.trim())
-        .then(() => { event.target.textContent = 'Copied!'; setTimeout(() => event.target.textContent='Copy', 1200); });
+    function copyText(id, btn) {
+      navigator.clipboard.writeText(document.getElementById(id).textContent.trim())
+        .then(() => { const t = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = t, 1200); });
     }
   </script>
 `);
@@ -308,7 +372,8 @@ app.get('/token', (req, res) => {
   const token = signJwt({ iss: PUBLIC_URL, sub: email, email, site, iat, exp });
   const expISO = new Date(exp * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
   const mcpUrl = `https://mcp-${site}.${MCP_BASE_DOMAIN}/`;
-  res.send(tokenHtml({ email, site, token, expISO, mcpUrl }));
+  const siteInfo = getSiteInfo(site);
+  res.send(tokenHtml({ email, site, token, expISO, mcpUrl, siteInfo }));
 });
 
 app.get('/logout', (_req, res) => {
