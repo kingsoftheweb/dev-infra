@@ -37,8 +37,10 @@ cp "$REPO_DIR/edge/docker-compose.yml" /srv/edge/docker-compose.yml
 echo "==> Bringing up edge Caddy"
 ( cd /srv/edge && docker compose up -d )
 
-echo "==> Installing bootstrap-site script + template"
+echo "==> Installing bootstrap-site script + template + enter-site wrapper"
 install -m 0755 "$REPO_DIR/bootstrap-site.sh" /usr/local/bin/bootstrap-site
+install -d -m 0755 /usr/local/libexec
+install -m 0755 "$REPO_DIR/libexec/enter-site.sh" /usr/local/libexec/enter-site
 mkdir -p /usr/local/share/dev-infra
 cp -r "$REPO_DIR/site-template" /usr/local/share/dev-infra/
 
