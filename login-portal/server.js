@@ -171,8 +171,25 @@ function verifyOurJwt(token) {
   return { ok: true, claims: payload };
 }
 
-const ACCESS_TOKEN_TTL = parseInt(process.env.ACCESS_TOKEN_TTL || (15 * 60), 10);
+const ACCESS_TOKEN_TTL  = parseInt(process.env.ACCESS_TOKEN_TTL  || (15 * 60), 10);
 const REFRESH_TOKEN_TTL = parseInt(process.env.REFRESH_TOKEN_TTL || (30 * 24 * 3600), 10);
+const INSTALL_TOKEN_TTL = parseInt(process.env.INSTALL_TOKEN_TTL || (10 * 60), 10);
+
+// Short-lived token that gates the /setup endpoint. Embedded in the curl
+// command shown on the welcome page, so only someone who got the page
+// (= signed in with Google + on the access list) can fetch the installer.
+function signInstallToken({ email, site }) {
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt({
+    iss: PUBLIC_URL,
+    sub: email,
+    email,
+    site,
+    token_use: 'preview_install',
+    iat: now,
+    exp: now + INSTALL_TOKEN_TTL,
+  });
+}
 
 function issueOAuthTokens({ email, site, resource, client_id }) {
   const now = Math.floor(Date.now() / 1000);
@@ -287,55 +304,62 @@ const sitesHtml = (email, sites) => PAGE('Pick a site', `
   <p class="footer"><a href="/logout">Sign out</a></p>
 `);
 
-function tokenHtml({ email, site, token, expISO, mcpUrl, siteInfo }) {
+function tokenHtml({ email, site, token, installToken, expISO, mcpUrl, siteInfo }) {
   const publicUrl = siteInfo.public_url ||
     (siteInfo.domain ? `https://${siteInfo.domain}` : null);
   const repo = siteInfo.repo || null;
   const branch = siteInfo.branch || 'main';
 
   // Self-bootstrapping prompt. Claude sees this on any platform and:
-  //   1. Notices it doesn't have mcp__dev-shell__Bash yet → runs the right
-  //      setup step for its surface (CLI command if it has shell access,
-  //      otherwise instructs the user)
-  //   2. After setup + restart, sees the tool → reads the briefing → starts
-  //      working on the user's task
-  // It's idempotent: pasting it again after the setup step is a no-op for
-  // setup and proceeds straight to the briefing.
-  const previewSetupUrl = `${PUBLIC_URL}/preview-setup?site=${encodeURIComponent(site)}`;
+  //   1. Notices it doesn't have mcp__dev-shell__Bash yet → runs the
+  //      one setup command for its surface (single curl on Claude Code
+  //      Desktop; manual Settings step on web/mobile)
+  //   2. After setup + restart, sees the tool → reads the briefing →
+  //      starts working on the user's task
+  // It's idempotent: pasting it again after the setup step is a no-op
+  // for setup and proceeds straight to the briefing.
+  const setupUrl = `${PUBLIC_URL}/setup?site=${encodeURIComponent(site)}`;
+  // Single curl handles BOTH the MCP registration AND the local preview
+  // pane templates. Auth via Authorization header (so the token isn't in
+  // shell history alongside the URL).
+  const setupCmd =
+    `curl -fsSL -H "Authorization: Bearer ${installToken}" \\\n` +
+    `  ${setupUrl} | bash`;
+
   const claudePrompt =
 `Help me develop ${site}. The dev environment for it lives at:
   ${mcpUrl}
 
 ═══════════════════════════════════════════════════════════════════
-STEP 1 — Setup (one-time per device)
+STEP 1 — Setup (MANDATORY, one-time per device)
 ═══════════════════════════════════════════════════════════════════
 
-(1A) Connect the dev-shell MCP server. Check your tools — if you
-already have \`mcp__dev-shell__Bash\`, skip to (1B).
+IF you are Claude Code (Desktop or CLI):
 
-Otherwise:
-  • Claude Code (Desktop or CLI) — run this with your Bash tool:
-      claude mcp add dev-shell --transport http ${mcpUrl}
-  • Claude web (claude.ai) or mobile — tell me to:
-      Settings → Connectors → Add custom connector
-      URL: ${mcpUrl}
+  Run this EXACT command from the project folder using your built-in
+  Bash tool. Do not skip it, do not split it, do not modify it:
 
-On first use of dev-shell you'll be sent to a browser to sign in
-with Google and click "Authorize" — that's the OAuth handshake.
+${setupCmd.split('\n').map(l => '      ' + l).join('\n')}
 
-(1B) Wire up the local preview pane (Claude Code Desktop only —
-skip if I'm on web or mobile). This makes a live, same-origin view
-of the dev site appear in Claude Code's preview pane (Cmd+Shift+P),
-with HMR pushing edits through automatically.
+  It writes three files in this folder:
+    .mcp.json            — registers the dev-shell MCP server
+    .claude/launch.json  — declares the local preview-pane proxy
+    .claude/proxy.js     — the proxy itself, templated for ${site}
 
-Run this in the current project folder using your Bash tool:
-      curl -fsSL ${previewSetupUrl} | bash
+  Then ask me to restart Claude Code. After restart, re-paste this
+  same message; setup is idempotent and we'll proceed to STEP 2.
 
-It drops .claude/launch.json + .claude/proxy.js in this folder,
-templated for ${site}. The preview pane auto-starts on next session.
+IF you are Claude on web (claude.ai) or mobile:
 
-After (1A) + optionally (1B), tell me to restart Claude Code (or
-restart the chat on web/mobile) and I'll re-paste this same message.
+  Tell me to do this in my Claude settings:
+    Settings → Connectors → Add custom connector
+    URL: ${mcpUrl}
+  (No local files; no preview pane on these surfaces. I'll view the
+   dev site at ${publicUrl || mcpUrl} in a browser tab.)
+
+ON FIRST USE OF dev-shell:
+  A browser tab will open for Google sign-in and an "Authorize"
+  prompt. That is the OAuth handshake — I'll click Authorize.
 
 ═══════════════════════════════════════════════════════════════════
 STEP 2 — once mcp__dev-shell__Bash is available, here's the context
@@ -578,7 +602,8 @@ app.get('/token', (req, res) => {
   const expISO = new Date(exp * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
   const mcpUrl = `https://mcp-${site}.${MCP_BASE_DOMAIN}/`;
   const siteInfo = getSiteInfo(site);
-  res.send(tokenHtml({ email, site, token, expISO, mcpUrl, siteInfo }));
+  const installToken = signInstallToken({ email, site });
+  res.send(tokenHtml({ email, site, token, installToken, expISO, mcpUrl, siteInfo }));
 });
 
 // ---- OAuth 2.1 endpoints ----------------------------------------------
@@ -749,46 +774,98 @@ app.post('/oauth/token', (req, res) => {
   return res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
-// Self-installer for the local Claude Code Desktop preview pane.
-// Pipe to bash:  curl -fsSL https://login.apps.futrx.xyz/preview-setup?site=X | bash
-// Writes .claude/launch.json + .claude/proxy.js into the cwd. The proxy is
-// templated with the chosen site's public hostname.
-app.get('/preview-setup', (req, res) => {
+// Combined self-installer for Claude Code Desktop. Writes BOTH the MCP
+// config (.mcp.json) AND the preview-pane templates (.claude/...). Auth
+// is required: the install token is issued by /token and embedded in the
+// curl command on the welcome page. 10-minute TTL.
+//
+// Pipe to bash:
+//   curl -fsSL -H "Authorization: Bearer <install_token>" \
+//        https://login.apps.futrx.xyz/setup?site=X | bash
+app.get('/setup', (req, res) => {
   const site = String(req.query.site || '').trim();
+
+  // Auth: install token in Authorization: Bearer header.
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) {
+    res.status(401).type('text/plain').send(
+      '# Unauthorized: missing Authorization: Bearer <install_token> header.\n' +
+      `# Get a fresh install URL from ${PUBLIC_URL}/sites\n`);
+    return;
+  }
+  const v = verifyOurJwt(h.slice(7));
+  if (!v.ok) {
+    res.status(401).type('text/plain').send(
+      `# Unauthorized: ${v.reason}.\n` +
+      `# Get a fresh install URL from ${PUBLIC_URL}/sites\n`);
+    return;
+  }
+  if (v.claims.token_use !== 'preview_install') {
+    res.status(403).type('text/plain').send('# Wrong token type for this endpoint.\n');
+    return;
+  }
+  if (v.claims.site !== site) {
+    res.status(403).type('text/plain').send(
+      `# Token issued for site '${v.claims.site}', not '${site}'.\n`);
+    return;
+  }
+
   const info = getSiteInfo(site);
   if (!info || !info.domain) {
-    return res.status(404).type('text/plain').send(`# unknown site: ${site || '<missing>'}\n`);
+    return res.status(404).type('text/plain').send(`# unknown site: ${site}\n`);
   }
-  const target = info.domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const target  = info.domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mcpUrl  = `https://mcp-${site}.${MCP_BASE_DOMAIN}/`;
   const proxyJs = PREVIEW_PROXY_JS_TMPL.replace(/__TARGET_HOST__/g, target);
+  const mcpJson = JSON.stringify({
+    mcpServers: { 'dev-shell': { url: mcpUrl } },
+  }, null, 2) + '\n';
+
   res.type('text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   res.send(`#!/usr/bin/env bash
-# Local preview-pane setup for site '${site}' (target: ${target}).
-# Generated by ${PUBLIC_URL}/preview-setup?site=${encodeURIComponent(site)}
+# Setup for site '${site}' (target: ${target}).
+# Issued to: ${v.claims.email}
+# Generated by ${PUBLIC_URL}/setup
 set -euo pipefail
 
-if [[ -e .claude/proxy.js || -e .claude/launch.json ]]; then
-  echo "✗ .claude/proxy.js or .claude/launch.json already exists." >&2
-  echo "  Refusing to overwrite. Remove them first if you want to reinstall." >&2
-  exit 1
-fi
+# Refuse to overwrite if any target file exists — keeps repeat runs safe.
+for f in .mcp.json .claude/launch.json .claude/proxy.js; do
+  if [[ -e "$f" ]]; then
+    echo "✗ \\\$f already exists. Refusing to overwrite." >&2
+    echo "  Remove it first (rm \\\$f) if you want to reinstall." >&2
+    exit 1
+  fi
+done
 
 mkdir -p .claude
 
-cat > .claude/launch.json <<'__PREVIEW_LAUNCH_EOF__'
-${PREVIEW_LAUNCH_JSON}__PREVIEW_LAUNCH_EOF__
+cat > .mcp.json <<'__MCP_JSON_EOF__'
+${mcpJson}__MCP_JSON_EOF__
 
-cat > .claude/proxy.js <<'__PREVIEW_PROXY_EOF__'
-${proxyJs}__PREVIEW_PROXY_EOF__
+cat > .claude/launch.json <<'__LAUNCH_JSON_EOF__'
+${PREVIEW_LAUNCH_JSON}__LAUNCH_JSON_EOF__
 
-echo "✓ Local preview pane wired up for site '${site}'."
-echo "  Proxy target:  https://${target}"
-echo "  Local URL:     http://localhost:8787/  (after Claude Code starts the preview)"
+cat > .claude/proxy.js <<'__PROXY_JS_EOF__'
+${proxyJs}__PROXY_JS_EOF__
+
+echo "✓ Setup complete for site '${site}'."
+echo "  .mcp.json            — registered MCP: ${mcpUrl}"
+echo "  .claude/launch.json  — preview-pane spec"
+echo "  .claude/proxy.js     — proxy → https://${target}"
 echo
-echo "Next: restart Claude Code Desktop in this folder. The preview pane"
-echo "      (Cmd+Shift+P) auto-starts and shows the live dev site."
+echo "Next: restart Claude Code in this folder."
+echo "  • Claude Code prompts you to approve the new MCP server — approve it."
+echo "  • On first MCP use, a browser opens for Google sign-in + Authorize."
+echo "  • The preview pane (Cmd+Shift+P) auto-launches the proxy."
 `);
+});
+
+// Back-compat: /preview-setup → 410 with a pointer to the new endpoint.
+app.get('/preview-setup', (_req, res) => {
+  res.status(410).type('text/plain').send(
+    '# /preview-setup is gone — replaced by /setup (auth-gated, combined).\n' +
+    `# Visit ${PUBLIC_URL}/sites and copy the fresh paste-into-Claude prompt.\n`);
 });
 
 app.get('/logout', (_req, res) => {
