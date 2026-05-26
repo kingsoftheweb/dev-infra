@@ -1,6 +1,8 @@
 FROM node:20-alpine
 
-RUN apk add --no-cache tini
+# docker-cli lets us `docker exec` into per-site containers to fetch
+# CLAUDE.md (and possibly other project files) on demand.
+RUN apk add --no-cache tini docker-cli
 
 WORKDIR /app
 

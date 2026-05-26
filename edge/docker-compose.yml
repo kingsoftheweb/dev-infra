@@ -40,6 +40,9 @@ services:
     volumes:
       - /srv/jwt-secret:/run/jwt-secret:ro
       - /srv/access.json:/run/access.json:ro
+      # docker socket → docker exec into per-site containers (e.g. to fetch
+      # CLAUDE.md from a site's repo at /setup time).
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - edge
     labels:
