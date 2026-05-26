@@ -46,23 +46,26 @@ function signJwt(claims) {
 }
 
 function setSignedCookie(res, name, value, maxAgeMs) {
-  const sig = crypto.createHmac('sha256', COOKIE_SECRET).update(value).digest('base64url');
+  // Encode the payload with base64url so the value contains no `.` —
+  // we use `.` as the value/signature delimiter. URL-encoding wasn't
+  // sufficient because emails contain literal dots (e.g. .com).
+  const enc = Buffer.from(value, 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', COOKIE_SECRET).update(enc).digest('base64url');
   res.append('Set-Cookie',
-    `${name}=${encodeURIComponent(value)}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(maxAgeMs/1000)}`);
+    `${name}=${enc}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(maxAgeMs/1000)}`);
 }
 function getSignedCookie(req, name) {
   const raw = (req.headers.cookie || '')
     .split(';').map(s => s.trim()).find(s => s.startsWith(name+'='));
   if (!raw) return null;
-  const [encValue, sig] = raw.slice(name.length+1).split('.');
-  if (!encValue || !sig) return null;
-  const value = decodeURIComponent(encValue);
-  const expected = crypto.createHmac('sha256', COOKIE_SECRET).update(value).digest('base64url');
+  const [enc, sig] = raw.slice(name.length+1).split('.');
+  if (!enc || !sig) return null;
+  const expected = crypto.createHmac('sha256', COOKIE_SECRET).update(enc).digest('base64url');
   try {
     if (sig.length !== expected.length) return null;
     if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
   } catch { return null; }
-  return value;
+  return Buffer.from(enc, 'base64url').toString('utf8');
 }
 function clearCookie(res, name) {
   res.append('Set-Cookie', `${name}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
