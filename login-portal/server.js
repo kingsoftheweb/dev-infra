@@ -284,59 +284,97 @@ function tokenHtml({ email, site, token, expISO, mcpUrl, siteInfo }) {
   const repo = siteInfo.repo || null;
   const branch = siteInfo.branch || 'main';
 
-  // Build the message the user pastes into Claude. Self-contained: Claude
-  // sees this and has everything it needs to start working.
-  const claudeInstructions =
-`Connect me to the dev environment for ${site}.
+  // Self-bootstrapping prompt. Claude sees this on any platform and:
+  //   1. Notices it doesn't have mcp__dev-shell__Bash yet → runs the right
+  //      setup step for its surface (CLI command if it has shell access,
+  //      otherwise instructs the user)
+  //   2. After setup + restart, sees the tool → reads the briefing → starts
+  //      working on the user's task
+  // It's idempotent: pasting it again after the setup step is a no-op for
+  // setup and proceeds straight to the briefing.
+  const claudePrompt =
+`Help me develop ${site}. The dev environment for it lives at:
+  ${mcpUrl}
 
-Add this MCP server (no other config needed):
-  Name: dev-shell
-  URL: ${mcpUrl}
-  Bearer token: ${token}
+═══════════════════════════════════════════════════════════════════
+STEP 1 — make sure you have the dev-shell tool
+═══════════════════════════════════════════════════════════════════
 
-Once connected, you have a Bash tool that runs commands inside a Linux
-container as user 'dev'. Default working directory: /home/dev/app.
+Check your available tools. If you already have \`mcp__dev-shell__Bash\`,
+skip to STEP 2.
+
+Otherwise, connect it:
+
+  • Claude Code (Desktop or CLI) — run this with your Bash tool:
+      claude mcp add dev-shell --transport http ${mcpUrl}
+    Then tell me to restart Claude Code, and I'll re-paste this message
+    so we resume.
+
+  • Claude on web (claude.ai) or mobile — tell me to:
+      Settings → Connectors → Add custom connector
+      URL:  ${mcpUrl}
+    Then I'll re-paste this message.
+
+On first use you'll be prompted in a browser to "Sign in with Google"
+and "Authorize" — that's the OAuth handshake. Approve it.
+
+═══════════════════════════════════════════════════════════════════
+STEP 2 — once mcp__dev-shell__Bash is available, here's the context
+═══════════════════════════════════════════════════════════════════
+
+You're inside a Linux container as user 'dev', default cwd /home/dev/app.
 
 What you can assume:
-- Source code is at /home/dev/app${repo ? ` (clone of ${repo}, branch '${branch}')` : ''}
-- Vite dev server is running with HMR; saved file changes appear live at${publicUrl ? `
+- Source: /home/dev/app${repo ? ` (clone of ${repo}, branch '${branch}')` : ''}
+- Vite dev server with HMR; saved file edits go live at${publicUrl ? `
   ${publicUrl}` : ' the public URL'}
-- Git is configured (deploy key, read-write): pull / commit / push all work
+- Git pull/commit/push work (deploy key, read-write)
 - Container has Node 20, npm, git, curl, sudo (passwordless), bash
-- You can install more with: sudo apk add <package>
-- There is no local filesystem to edit — make all changes via Bash
+- Install anything with: sudo apk add <package>
+- No local filesystem to edit — all changes via Bash
 - Verify visual changes by refreshing${publicUrl ? ` ${publicUrl}` : ' the site URL'}
 
 When in doubt:
 - Explore: \`find . -type f | head\`, \`ls\`, \`cat README.md\`
 - Locate code: \`grep -r '<keyword>' src/\`
-- Check vite picked up an edit: \`docker logs ${site}\` (run from host via ssh
-  is needed; otherwise trust HMR and refresh the page)
 - Look at running processes: \`ps aux\`
 
-Start by reading the project README and showing me the directory tree.`;
+Start by reading the README and showing me the project tree, then wait
+for my next instruction.`;
 
-  return PAGE(`Token: ${site}`, `
-  <h1>Token for ${escapeHtml(site)}</h1>
-  <p class="muted">Issued to ${escapeHtml(email)} · valid until ${escapeHtml(expISO)}</p>
+  return PAGE(`Connect: ${site}`, `
+  <h1>You're in.</h1>
+  <p class="muted">Signed in as <strong>${escapeHtml(email)}</strong>. Site: <strong>${escapeHtml(site)}</strong>.</p>
 
   <div class="card">
-    <p><strong>Paste this into Claude</strong></p>
-    <p class="muted">Self-contained — Claude will know everything it needs.</p>
+    <p style="margin-top:0"><strong>Paste this into Claude.</strong> One message handles connect + setup + briefing.</p>
     <div class="token-box">
-      <pre id="instructions">${escapeHtml(claudeInstructions)}</pre>
-      <button class="copy-btn" onclick="copyText('instructions', this)">Copy all</button>
+      <pre id="prompt">${escapeHtml(claudePrompt)}</pre>
+      <button class="copy-btn" onclick="copyText('prompt', this)">Copy</button>
     </div>
+    <p class="muted" style="margin-top:0">
+      First time on this device, Claude will walk you through one short setup
+      step (a CLI command or a Settings tweak), then ask you to restart and
+      re-paste. After that, the same paste just works.
+    </p>
   </div>
 
   <details>
-    <summary>Just the token (HS256 JWT)</summary>
+    <summary>Just the MCP URL</summary>
+    <p class="muted">Use this if you want to add the connector by hand.</p>
+    <div class="token-box" style="margin-top:8px">
+      <pre id="mcpUrl">${escapeHtml(mcpUrl)}</pre>
+      <button class="copy-btn" onclick="copyText('mcpUrl', this)">Copy</button>
+    </div>
+  </details>
+
+  <details>
+    <summary>Manual bearer token (skips OAuth — for one-off scripts)</summary>
+    <p class="muted">Lasts until ${escapeHtml(expISO)}. Send as <code>Authorization: Bearer …</code>.</p>
     <div class="token-box" style="margin-top:8px">
       <pre id="token">${escapeHtml(token)}</pre>
       <button class="copy-btn" onclick="copyText('token', this)">Copy</button>
     </div>
-    <p class="muted">Or, in Claude Code Desktop, export this in your shell and reload the session:</p>
-    <pre>export DEV_MCP_TOKEN=${escapeHtml(token)}</pre>
   </details>
 
   <details>
@@ -345,7 +383,7 @@ Start by reading the project README and showing me the directory tree.`;
       <li>MCP URL: <code>${escapeHtml(mcpUrl)}</code></li>
       ${publicUrl ? `<li>Public URL: <code>${escapeHtml(publicUrl)}</code></li>` : ''}
       ${repo ? `<li>Repo: <code>${escapeHtml(repo)}</code> · branch <code>${escapeHtml(branch)}</code></li>` : ''}
-      <li>Valid until: <code>${escapeHtml(expISO)}</code></li>
+      <li>Sign-in valid for the duration of your browser session.</li>
     </ul>
   </details>
 
