@@ -182,8 +182,13 @@ if [[ ! -f "$REPO_DIR/Dockerfile" ]]; then
   install -m 0644 "$TEMPLATE/Dockerfile" "$REPO_DIR/Dockerfile"
 fi
 
-# Generate the per-site MCP bearer token (32 bytes → 43 url-safe chars).
-MCP_TOKEN="$(openssl rand -base64 32 | tr '/+' '_-' | tr -d '=' | tr -d '\n')"
+# MCP auth is JWT issued by the login portal; no per-site bearer secret needed.
+# The JWT signing secret lives at /srv/jwt-secret and is mounted into the
+# mcp container by the compose file.
+if [[ ! -s /srv/jwt-secret ]]; then
+  echo "ERROR: /srv/jwt-secret missing. Run install.sh first." >&2
+  exit 1
+fi
 
 cat > "$SITE_DIR/.env" <<EOF
 SLUG=$SLUG
@@ -191,7 +196,6 @@ DOMAIN=$DOMAIN
 REPO_NAME=$REPO_NAME
 DEV_UID=$NEXT_UID
 MCP_DOMAIN=$MCP_DOMAIN
-MCP_TOKEN=$MCP_TOKEN
 EOF
 chmod 600 "$SITE_DIR/.env"
 chown "$SLUG":"$SLUG" "$SITE_DIR/.env" "$SITE_DIR/docker-compose.yml" "$SITE_DIR/start.sh"
@@ -211,8 +215,9 @@ echo " App container:     docker logs -f $SLUG"
 echo
 echo " MCP endpoint:      https://$MCP_DOMAIN/"
 echo " MCP container:     docker logs -f $SLUG-mcp"
-echo " MCP bearer token:  $MCP_TOKEN"
-echo "   (save this — use in Authorization: Bearer <token> header)"
+echo " MCP auth:          JWT issued by https://login.apps.futrx.xyz"
+echo "   Add an authorized email to /srv/access.json, then have the user"
+echo "   sign in there to get a 24h token for this site."
 
 if [[ -n "$GENERATED_OP_PRIV" ]]; then
   echo

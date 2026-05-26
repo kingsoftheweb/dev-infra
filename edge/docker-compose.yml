@@ -27,6 +27,26 @@ services:
       - edge
     restart: unless-stopped
 
+  login:
+    image: dev-login:latest    # built by install.sh from dev-infra/login-portal/
+    container_name: edge-login
+    env_file:
+      - /srv/login/.env        # GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, COOKIE_SECRET
+    environment:
+      PUBLIC_URL: ${LOGIN_PUBLIC_URL:-https://login.apps.futrx.xyz}
+      MCP_BASE_DOMAIN: ${MCP_BASE_DOMAIN:-apps.futrx.xyz}
+      JWT_SECRET_FILE: /run/jwt-secret
+      ACCESS_FILE: /run/access.json
+    volumes:
+      - /srv/jwt-secret:/run/jwt-secret:ro
+      - /srv/access.json:/run/access.json:ro
+    networks:
+      - edge
+    labels:
+      caddy: ${LOGIN_DOMAIN:-login.apps.futrx.xyz}
+      caddy.reverse_proxy: "{{upstreams 3000}}"
+    restart: unless-stopped
+
 networks:
   edge:
     name: edge

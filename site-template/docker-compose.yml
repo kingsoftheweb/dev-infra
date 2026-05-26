@@ -1,7 +1,7 @@
 # Per-site dev stack — two containers, both fronted by the shared edge Caddy:
 #   - `app`: vite dev server (HMR), bind-mounts the site dir
 #   - `mcp`: HTTPS MCP server, exposes the Bash tool to remote Claude clients
-#           (bearer-token auth, scoped to this site's container)
+#           (auth: HS256 JWT issued by the login portal, validated here)
 
 services:
   app:
@@ -34,12 +34,14 @@ services:
     image: dev-mcp:latest    # built by install.sh from dev-infra/mcp-server/
     container_name: ${SLUG}-mcp
     environment:
-      MCP_TOKEN: ${MCP_TOKEN}
       MCP_SITE: ${SLUG}
       MCP_LABEL: dev-shell-${SLUG}
+      JWT_SECRET_FILE: /run/jwt-secret
     volumes:
       # Talks to host docker to exec into the `app` container above.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Shared JWT-signing secret — same file the login portal uses to sign.
+      - /srv/jwt-secret:/run/jwt-secret:ro
     networks:
       - edge
     labels:

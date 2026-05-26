@@ -2,21 +2,23 @@
 // HTTPS MCP server — exposes the Bash tool to remote MCP clients.
 //
 // Transport: MCP Streamable HTTP (single JSON-RPC POST → single JSON response).
-// Auth:      Bearer token (env MCP_TOKEN, compared in constant time).
-// Scope:     One container, named in env MCP_SITE. Every Bash call execs
-//            into that container as user `dev`.
+// Auth:      HS256 JWT issued by the login portal; signature, exp, and `site`
+//            claim all verified before any tool runs.
+// Scope:     One container, named in env MCP_SITE. Every Bash call execs into
+//            that container as user `dev`.
 //
 // Required env:
-//   MCP_TOKEN   bearer token; clients send `Authorization: Bearer <token>`
-//   MCP_SITE    docker container name (e.g. "futrx-com")
+//   MCP_SITE         docker container name (e.g. "futrx-com")
+//   JWT_SECRET_FILE  path to the shared JWT-signing secret (default /run/jwt-secret)
 //
 // Optional env:
 //   PORT              listen port (default 3000)
 //   MCP_DEFAULT_CWD   default working dir inside the container (default /home/dev/app)
-//   MCP_LABEL         human label included in serverInfo.name (default: dev-shell-${MCP_SITE})
+//   MCP_LABEL         human label included in serverInfo.name
 
 'use strict';
 const http = require('http');
+const fs = require('fs');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
@@ -29,20 +31,63 @@ function required(name) {
   return v;
 }
 
-const TOKEN = required('MCP_TOKEN');
-const SITE  = required('MCP_SITE');
-const PORT  = parseInt(process.env.PORT || '3000', 10);
+const SITE = required('MCP_SITE');
+const PORT = parseInt(process.env.PORT || '3000', 10);
 const DEFAULT_CWD = process.env.MCP_DEFAULT_CWD || '/home/dev/app';
 const LABEL = process.env.MCP_LABEL || `dev-shell-${SITE}`;
+const JWT_SECRET_FILE = process.env.JWT_SECRET_FILE || '/run/jwt-secret';
 
-const TOKEN_BUF = Buffer.from(`Bearer ${TOKEN}`);
-
-function constantTimeEq(a, b) {
-  const ab = Buffer.from(a || '');
-  if (ab.length !== b.length) return false;
-  return crypto.timingSafeEqual(ab, b);
+const JWT_SECRET = fs.readFileSync(JWT_SECRET_FILE, 'utf8').trim();
+if (!JWT_SECRET) {
+  console.error('JWT secret file is empty');
+  process.exit(1);
 }
 
+// ---- JWT verify (HS256 only) ------------------------------------------
+function b64urlToBuf(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Buffer.from(s, 'base64');
+}
+
+function verifyJwt(token) {
+  if (typeof token !== 'string') return { ok: false, reason: 'not a string' };
+  const parts = token.split('.');
+  if (parts.length !== 3) return { ok: false, reason: 'malformed' };
+  const [h, p, s] = parts;
+
+  let header, payload;
+  try {
+    header = JSON.parse(b64urlToBuf(h).toString('utf8'));
+    payload = JSON.parse(b64urlToBuf(p).toString('utf8'));
+  } catch {
+    return { ok: false, reason: 'undecodable' };
+  }
+  if (header.alg !== 'HS256' || header.typ !== 'JWT') {
+    return { ok: false, reason: 'bad header' };
+  }
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${p}`).digest();
+  const got = b64urlToBuf(s);
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
+    return { ok: false, reason: 'bad signature' };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== 'number' || payload.exp < now) {
+    return { ok: false, reason: 'expired' };
+  }
+  if (payload.site !== SITE) {
+    return { ok: false, reason: `wrong site (${payload.site}, expected ${SITE})` };
+  }
+  return { ok: true, claims: payload };
+}
+
+function authHeader(req) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return null;
+  return h.slice(7);
+}
+
+// ---- docker exec -------------------------------------------------------
 function shellQuote(s) {
   return `'${String(s).replace(/'/g, "'\\''")}'`;
 }
@@ -67,6 +112,7 @@ function dockerExec(command, { cwd = DEFAULT_CWD, timeoutSeconds = 120 } = {}) {
   };
 }
 
+// ---- MCP tool surface --------------------------------------------------
 const TOOLS = [
   {
     name: 'Bash',
@@ -79,22 +125,10 @@ const TOOLS = [
       type: 'object',
       required: ['command'],
       properties: {
-        command: {
-          type: 'string',
-          description: 'Shell command(s) to execute. Can be multi-line.',
-        },
-        cwd: {
-          type: 'string',
-          description: `Working directory inside the container (default ${DEFAULT_CWD}).`,
-        },
-        timeout: {
-          type: 'integer',
-          description: 'Timeout in seconds (default 120, max 900).',
-        },
-        description: {
-          type: 'string',
-          description: 'Short description of what this command does (shown to the user).',
-        },
+        command: { type: 'string', description: 'Shell command(s) to execute. Can be multi-line.' },
+        cwd:     { type: 'string', description: `Working directory inside the container (default ${DEFAULT_CWD}).` },
+        timeout: { type: 'integer', description: 'Timeout in seconds (default 120, max 900).' },
+        description: { type: 'string', description: 'Short description of what this command does (shown to the user).' },
       },
     },
   },
@@ -103,16 +137,16 @@ const TOOLS = [
 function ok(id, result)  { return { jsonrpc: '2.0', id, result }; }
 function err(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
 
-function handle(msg) {
+function handle(msg, claims) {
   const { id, method, params } = msg;
   if (method === 'initialize') {
     return ok(id, {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: LABEL, version: '0.3.0' },
+      serverInfo: { name: LABEL, version: '0.4.0' },
     });
   }
-  if (method === 'notifications/initialized') return null;  // notification, no response
+  if (method === 'notifications/initialized') return null;
   if (method === 'tools/list') return ok(id, { tools: TOOLS });
   if (method === 'tools/call') {
     if (!params || params.name !== 'Bash') {
@@ -123,6 +157,7 @@ function handle(msg) {
       return err(id, -32602, 'command (string) is required');
     }
     const timeout = Math.min(Math.max(parseInt(a.timeout, 10) || 120, 1), 900);
+    console.error(`[exec by ${claims.email}] ${a.command.split('\n')[0].slice(0, 80)}`);
     const r = dockerExec(a.command, { cwd: a.cwd, timeoutSeconds: timeout });
     return ok(id, {
       content: [{ type: 'text', text: JSON.stringify(r, null, 2) }],
@@ -134,6 +169,7 @@ function handle(msg) {
   return null;
 }
 
+// ---- HTTP --------------------------------------------------------------
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, Mcp-Session-Id');
@@ -161,9 +197,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (!constantTimeEq(req.headers.authorization, TOKEN_BUF)) {
+  const token = authHeader(req);
+  const v = verifyJwt(token);
+  if (!v.ok) {
     res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="mcp"' });
-    res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' } }));
+    res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: `Unauthorized: ${v.reason}` } }));
     return;
   }
 
@@ -180,7 +218,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const response = handle(msg);
+      const response = handle(msg, v.claims);
       if (response === null) {
         res.writeHead(202);
         res.end();
@@ -196,5 +234,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.error(`MCP server listening on :${PORT} (site=${SITE})`);
+  console.error(`MCP server listening on :${PORT} (site=${SITE}, auth=JWT HS256)`);
 });
