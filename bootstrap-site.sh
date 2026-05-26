@@ -32,6 +32,7 @@ fi
 # -------- args -----------------------------------------------------------
 SLUG=""; DOMAIN=""; REPO=""; BRANCH="main"
 OP_PUBKEY_IN=""; DEPLOY_KEY_IN=""; NON_INTERACTIVE=0
+MCP_BASE_DOMAIN=""  # e.g. apps.futrx.xyz — MCP endpoint will be mcp-<slug>.<base>
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --slug)              SLUG="$2"; shift 2 ;;
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --operator-pubkey)   OP_PUBKEY_IN="$2"; shift 2 ;;
     --deploy-key)        DEPLOY_KEY_IN="$2"; NON_INTERACTIVE=1; shift 2 ;;
     --non-interactive)   NON_INTERACTIVE=1; shift ;;
+    --mcp-base-domain)   MCP_BASE_DOMAIN="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
@@ -48,6 +50,15 @@ done
 : "${SLUG:?--slug required}"
 : "${DOMAIN:?--domain required}"
 : "${REPO:?--repo required (git SSH URL)}"
+
+# Resolve MCP base domain: explicit flag, then /etc/dev-infra.conf, else default.
+if [[ -z "$MCP_BASE_DOMAIN" && -f /etc/dev-infra.conf ]]; then
+  # shellcheck disable=SC1091
+  source /etc/dev-infra.conf
+  MCP_BASE_DOMAIN="${MCP_BASE_DOMAIN:-}"
+fi
+MCP_BASE_DOMAIN="${MCP_BASE_DOMAIN:-apps.futrx.xyz}"
+MCP_DOMAIN="mcp-${SLUG}.${MCP_BASE_DOMAIN}"
 
 # -------- preflight ------------------------------------------------------
 SITE_DIR="/srv/sites/$SLUG"
@@ -171,12 +182,18 @@ if [[ ! -f "$REPO_DIR/Dockerfile" ]]; then
   install -m 0644 "$TEMPLATE/Dockerfile" "$REPO_DIR/Dockerfile"
 fi
 
+# Generate the per-site MCP bearer token (32 bytes → 43 url-safe chars).
+MCP_TOKEN="$(openssl rand -base64 32 | tr '/+' '_-' | tr -d '=' | tr -d '\n')"
+
 cat > "$SITE_DIR/.env" <<EOF
 SLUG=$SLUG
 DOMAIN=$DOMAIN
 REPO_NAME=$REPO_NAME
 DEV_UID=$NEXT_UID
+MCP_DOMAIN=$MCP_DOMAIN
+MCP_TOKEN=$MCP_TOKEN
 EOF
+chmod 600 "$SITE_DIR/.env"
 chown "$SLUG":"$SLUG" "$SITE_DIR/.env" "$SITE_DIR/docker-compose.yml" "$SITE_DIR/start.sh"
 
 # -------- bring up container --------------------------------------------
@@ -188,9 +205,14 @@ echo
 echo "============================================================"
 echo " Site '$SLUG' is up."
 echo
-echo " Public URL:    https://$DOMAIN  (LE cert ~30s after first start)"
-echo " SSH command:   ssh $SLUG@$(hostname -f 2>/dev/null || hostname)"
-echo " Container:     docker logs -f $SLUG"
+echo " Public URL:        https://$DOMAIN  (LE cert ~30s after first start)"
+echo " SSH command:       ssh $SLUG@$(hostname -f 2>/dev/null || hostname)"
+echo " App container:     docker logs -f $SLUG"
+echo
+echo " MCP endpoint:      https://$MCP_DOMAIN/"
+echo " MCP container:     docker logs -f $SLUG-mcp"
+echo " MCP bearer token:  $MCP_TOKEN"
+echo "   (save this — use in Authorization: Bearer <token> header)"
 
 if [[ -n "$GENERATED_OP_PRIV" ]]; then
   echo

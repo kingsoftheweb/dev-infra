@@ -1,10 +1,7 @@
-# Per-site dev stack — one container, fronted by the shared edge Caddy.
-#
-# The container:
-#   - mounts the entire /srv/sites/<slug> dir as /home/dev (so the dev user's
-#     home, .ssh, and the repo all live in one place — easy to reason about)
-#   - runs start.sh which keeps `vite dev` alive
-#   - exposes :5173, which the edge Caddy reverse-proxies based on labels
+# Per-site dev stack — two containers, both fronted by the shared edge Caddy:
+#   - `app`: vite dev server (HMR), bind-mounts the site dir
+#   - `mcp`: HTTPS MCP server, exposes the Bash tool to remote Claude clients
+#           (bearer-token auth, scoped to this site's container)
 
 services:
   app:
@@ -31,6 +28,25 @@ services:
     labels:
       caddy: ${DOMAIN}
       caddy.reverse_proxy: "{{upstreams 5173}}"
+    restart: unless-stopped
+
+  mcp:
+    image: dev-mcp:latest    # built by install.sh from dev-infra/mcp-server/
+    container_name: ${SLUG}-mcp
+    environment:
+      MCP_TOKEN: ${MCP_TOKEN}
+      MCP_SITE: ${SLUG}
+      MCP_LABEL: dev-shell-${SLUG}
+    volumes:
+      # Talks to host docker to exec into the `app` container above.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - edge
+    labels:
+      caddy: ${MCP_DOMAIN}
+      caddy.reverse_proxy: "{{upstreams 3000}}"
+    depends_on:
+      - app
     restart: unless-stopped
 
 networks:
