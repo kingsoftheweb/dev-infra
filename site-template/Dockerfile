@@ -10,16 +10,26 @@
 #   - /home/dev/app is bind-mounted to the repo's working tree.
 #   - The container's CMD runs start.sh (provided by the site dir), which
 #     keeps the dev server alive in the foreground.
+#
+# Base image:
+#   We use node:20-slim (Debian) rather than alpine. Many modern JS deps
+#   ship glibc-only binaries (workerd for Cloudflare Workers, sharp,
+#   playwright, prisma, esbuild's optional native binaries) and fail with
+#   a cryptic "not found" on musl. Slim is ~50 MB compressed vs alpine ~40,
+#   trivial trade for working out of the box on every framework.
 
-FROM node:20-alpine
+FROM node:20-slim
 
 ARG DEV_UID=1500
 
-# bash, sudo, git: minimum DX. curl/wget: convenience for `docker exec` and
-# for sudo-installing more later. tini: clean PID 1 / signal handling so
+# bash + sudo + git + curl + tini: minimum DX. ca-certificates so the
+# Node-side TLS calls work. tini gives clean PID 1 / signal handling so
 # `docker stop` actually shuts vite down promptly.
-RUN apk add --no-cache bash sudo git curl wget tini openssh-client \
- && adduser -D -u "$DEV_UID" -s /bin/bash dev \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash sudo git curl wget tini ca-certificates openssh-client procps \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid "$DEV_UID" --shell /bin/bash dev \
  && echo "dev ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/dev \
  && chmod 0440 /etc/sudoers.d/dev
 
@@ -28,5 +38,5 @@ USER dev
 # *over* the bind-mount, breaking start.sh's symlink. start.sh `cd`s into
 # the right place itself.
 
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/home/dev/start.sh"]

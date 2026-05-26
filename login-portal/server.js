@@ -393,7 +393,7 @@ What you can assume:
   ${publicUrl}` : ' the public URL'}
 - Git pull/commit/push work (deploy key, read-write)
 - Container has Node 20, npm, git, curl, sudo (passwordless), bash
-- Install anything with: sudo apk add <package>
+- Install anything with: sudo apt-get install -y <package>
 - No local filesystem to edit — all changes via Bash
 - Verify visual changes by refreshing${publicUrl ? ` ${publicUrl}` : ' the site URL'}
 
