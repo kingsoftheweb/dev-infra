@@ -86,6 +86,109 @@ function getAuthorizedSites(email) {
   return Array.isArray(sites) ? sites : [];
 }
 
+// ---- OAuth state -------------------------------------------------------
+// Authorization codes — short-lived (5 min), single-use. In-memory map;
+// losing them on restart is fine (clients just re-authorize).
+const codes = new Map();
+function pruneCodes() {
+  const now = Date.now();
+  for (const [k, v] of codes) if (v.expires_at < now) codes.delete(k);
+}
+setInterval(pruneCodes, 60 * 1000).unref();
+
+// Registered OAuth clients (DCR). Persisted so a registered Claude client
+// stays usable across server restarts.
+const CLIENTS_FILE = process.env.CLIENTS_FILE || '/srv/oauth/clients.json';
+function loadClients() {
+  try { return JSON.parse(fs.readFileSync(CLIENTS_FILE, 'utf8')); }
+  catch { return {}; }
+}
+function saveClients(c) {
+  const dir = require('path').dirname(CLIENTS_FILE);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  fs.writeFileSync(CLIENTS_FILE, JSON.stringify(c, null, 2));
+}
+function registerClient(meta) {
+  const clients = loadClients();
+  const client_id = 'c_' + crypto.randomBytes(16).toString('hex');
+  clients[client_id] = {
+    client_name: typeof meta.client_name === 'string' ? meta.client_name.slice(0, 200) : 'Unknown client',
+    redirect_uris: meta.redirect_uris,
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'none',
+    application_type: meta.application_type || 'native',
+    registered_at: Math.floor(Date.now() / 1000),
+  };
+  saveClients(clients);
+  return { client_id, ...clients[client_id] };
+}
+function getClient(client_id) {
+  if (typeof client_id !== 'string') return null;
+  return loadClients()[client_id] || null;
+}
+
+// Map an MCP resource URI back to a site slug.  We canonicalize by host:
+// `https://mcp-<slug>.<MCP_BASE_DOMAIN>` → `<slug>`.
+function siteFromResource(resourceUri) {
+  try {
+    const u = new URL(String(resourceUri));
+    if (!u.hostname.endsWith('.' + MCP_BASE_DOMAIN) && u.hostname !== MCP_BASE_DOMAIN) return null;
+    const m = u.hostname.match(/^mcp-([^.]+)\./);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+// Verify a JWT we issued (signature + exp). Doesn't check claims.
+function verifyOurJwt(token) {
+  if (typeof token !== 'string') return { ok: false, reason: 'not a string' };
+  const parts = token.split('.');
+  if (parts.length !== 3) return { ok: false, reason: 'malformed' };
+  const [h, p, s] = parts;
+  let payload;
+  try {
+    const header = JSON.parse(Buffer.from(h, 'base64url').toString('utf8'));
+    if (header.alg !== 'HS256') return { ok: false, reason: 'bad alg' };
+    payload = JSON.parse(Buffer.from(p, 'base64url').toString('utf8'));
+  } catch { return { ok: false, reason: 'undecodable' }; }
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${p}`).digest();
+  const got = Buffer.from(s, 'base64url');
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
+    return { ok: false, reason: 'bad signature' };
+  }
+  if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now()/1000)) {
+    return { ok: false, reason: 'expired' };
+  }
+  return { ok: true, claims: payload };
+}
+
+const ACCESS_TOKEN_TTL = parseInt(process.env.ACCESS_TOKEN_TTL || (15 * 60), 10);
+const REFRESH_TOKEN_TTL = parseInt(process.env.REFRESH_TOKEN_TTL || (30 * 24 * 3600), 10);
+
+function issueOAuthTokens({ email, site, resource, client_id }) {
+  const now = Math.floor(Date.now() / 1000);
+  const jti = crypto.randomBytes(12).toString('hex');
+  const base = {
+    iss: PUBLIC_URL,
+    sub: email,
+    email,
+    aud: resource,
+    site,
+    scope: 'mcp',
+    client_id,
+    iat: now,
+  };
+  const access_token  = signJwt({ ...base, exp: now + ACCESS_TOKEN_TTL,  token_use: 'access',  jti });
+  const refresh_token = signJwt({ ...base, exp: now + REFRESH_TOKEN_TTL, token_use: 'refresh', jti });
+  return {
+    access_token,
+    refresh_token,
+    token_type: 'Bearer',
+    expires_in: ACCESS_TOKEN_TTL,
+    scope: 'mcp',
+  };
+}
+
 function getSiteInfo(slug) {
   const data = readAccess();
   return data?.sites?.[slug] || {};
@@ -260,11 +363,51 @@ Start by reading the project README and showing me the directory tree.`;
 `);
 }
 
+// ---- consent UI --------------------------------------------------------
+function consentHtml({ email, site, client, siteInfo, params }) {
+  const publicUrl = siteInfo.public_url || (siteInfo.domain ? `https://${siteInfo.domain}` : null);
+  const repo = siteInfo.repo || null;
+  const branch = siteInfo.branch || null;
+  // Hidden fields preserve every OAuth param for the POST.
+  const hiddenFields = ['response_type','client_id','redirect_uri','code_challenge',
+    'code_challenge_method','state','resource','scope']
+    .map(k => params[k] != null ? `<input type="hidden" name="${k}" value="${escapeHtml(String(params[k]))}">` : '')
+    .join('\n    ');
+  return PAGE(`Authorize ${escapeHtml(client.client_name)}`, `
+  <h1>Authorize access</h1>
+  <p><strong>${escapeHtml(client.client_name || 'An app')}</strong> wants to access the dev environment for
+     <strong>${escapeHtml(site)}</strong> on your behalf.</p>
+
+  <div class="card">
+    <p class="muted" style="margin:0 0 8px">Signed in as <strong>${escapeHtml(email)}</strong></p>
+    <p><strong>This will let it:</strong></p>
+    <ul style="line-height:1.7">
+      <li>Run any shell command inside the <code>${escapeHtml(site)}</code> container as user <code>dev</code></li>
+      <li>Read and modify files at <code>/home/dev/app</code></li>
+      ${repo ? `<li>Pull/push to <code>${escapeHtml(repo)}</code> (branch <code>${escapeHtml(branch)}</code>) via the configured deploy key</li>` : ''}
+      ${publicUrl ? `<li>Affect what's served at <code>${escapeHtml(publicUrl)}</code></li>` : ''}
+    </ul>
+    <p class="muted" style="margin-top:14px">Access tokens last 15&nbsp;minutes and refresh automatically.
+       You can revoke this app any time by signing out.</p>
+  </div>
+
+  <form method="POST" action="/oauth/authorize" style="margin-top:24px">
+    ${hiddenFields}
+    <button class="btn" name="decision" value="approve" style="background:#34a853">Authorize</button>
+    &nbsp;
+    <button class="btn btn-secondary" name="decision" value="deny" type="submit">Cancel</button>
+  </form>
+
+  <p class="footer"><a href="/logout">Sign out as a different user</a></p>
+`);
+}
+
 // ---- routes ------------------------------------------------------------
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);  // honor X-Forwarded-* from Caddy
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());   // for /oauth/register, which posts application/json
 
 // Request log: method, path, status, duration, any 'session' cookie status.
 app.use((req, res, next) => {
@@ -344,6 +487,11 @@ app.get('/auth/callback', async (req, res) => {
       return res.status(403).send(deniedHtml(email));
     }
     setSignedCookie(res, 'session', email, 24 * 3600 * 1000);
+    // Honor a post-auth redirect (set when /oauth/authorize bounces an
+    // unauthenticated user through Google). Must be a same-origin path.
+    const after = getSignedCookie(req, 'post_auth_redirect');
+    clearCookie(res, 'post_auth_redirect');
+    if (after && after.startsWith('/')) return res.redirect(after);
     res.redirect('/sites');
   } catch (e) {
     console.error('callback error:', e);
@@ -374,6 +522,174 @@ app.get('/token', (req, res) => {
   const mcpUrl = `https://mcp-${site}.${MCP_BASE_DOMAIN}/`;
   const siteInfo = getSiteInfo(site);
   res.send(tokenHtml({ email, site, token, expISO, mcpUrl, siteInfo }));
+});
+
+// ---- OAuth 2.1 endpoints ----------------------------------------------
+
+// AS metadata (RFC 8414). MCP clients fetch this after seeing the
+// resource-metadata pointer in the MCP server's 401 response.
+app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+  res.json({
+    issuer: PUBLIC_URL,
+    authorization_endpoint: `${PUBLIC_URL}/oauth/authorize`,
+    token_endpoint: `${PUBLIC_URL}/oauth/token`,
+    registration_endpoint: `${PUBLIC_URL}/oauth/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'],
+    scopes_supported: ['mcp'],
+    response_modes_supported: ['query'],
+  });
+});
+
+// Dynamic Client Registration (RFC 7591). Anyone can register a public
+// client — there's no client_secret; security comes from PKCE + the
+// user-consent gate in /oauth/authorize.
+app.post('/oauth/register', (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0) {
+    return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris[] required' });
+  }
+  for (const uri of body.redirect_uris) {
+    try {
+      const u = new URL(String(uri));
+      // Allow http only for loopback (Claude Code uses http://localhost:<port>/callback).
+      if (u.protocol === 'https:') continue;
+      if (u.protocol === 'http:' && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname)) continue;
+      return res.status(400).json({ error: 'invalid_redirect_uri', error_description: `disallowed: ${uri}` });
+    } catch {
+      return res.status(400).json({ error: 'invalid_redirect_uri', error_description: `not a URL: ${uri}` });
+    }
+  }
+  const result = registerClient(body);
+  res.status(201).json(result);
+});
+
+// Authorization endpoint — renders consent UI after the user is signed in.
+app.get('/oauth/authorize', (req, res) => {
+  const params = req.query;
+  const { response_type, client_id, redirect_uri, code_challenge,
+          code_challenge_method, resource } = params;
+
+  if (response_type !== 'code')
+    return res.status(400).type('text/plain').send('only response_type=code supported');
+  if (!client_id) return res.status(400).type('text/plain').send('client_id required');
+  if (!redirect_uri) return res.status(400).type('text/plain').send('redirect_uri required');
+  if (!code_challenge) return res.status(400).type('text/plain').send('code_challenge required (PKCE)');
+  if ((code_challenge_method || 'plain') !== 'S256')
+    return res.status(400).type('text/plain').send('only code_challenge_method=S256 supported');
+  if (!resource) return res.status(400).type('text/plain').send('resource parameter required (RFC 8707)');
+
+  const client = getClient(String(client_id));
+  if (!client) return res.status(400).type('text/plain').send('unknown client_id');
+  if (!client.redirect_uris.includes(String(redirect_uri))) {
+    return res.status(400).type('text/plain').send('redirect_uri not registered for this client');
+  }
+
+  const site = siteFromResource(resource);
+  if (!site) return res.status(400).type('text/plain')
+    .send(`cannot determine site from resource: ${resource}`);
+
+  const email = getSignedCookie(req, 'session');
+  if (!email) {
+    // Park the full /oauth/authorize URL in a cookie so we can resume after Google.
+    setSignedCookie(res, 'post_auth_redirect', req.originalUrl, 600 * 1000);
+    return res.redirect('/auth/google');
+  }
+
+  const sites = getAuthorizedSites(email);
+  if (!sites.includes(site)) return res.status(403).send(deniedHtml(email));
+
+  const siteInfo = getSiteInfo(site);
+  res.send(consentHtml({ email, site, client, siteInfo, params }));
+});
+
+// Authorization decision (consent form POST).
+app.post('/oauth/authorize', (req, res) => {
+  const body = req.body || {};
+  const { response_type, client_id, redirect_uri, code_challenge,
+          code_challenge_method, state, resource, decision } = body;
+
+  const email = getSignedCookie(req, 'session');
+  if (!email) return res.status(401).type('text/plain').send('not signed in');
+
+  const client = getClient(String(client_id));
+  if (!client || !client.redirect_uris.includes(String(redirect_uri))) {
+    return res.status(400).type('text/plain').send('bad client_id or redirect_uri');
+  }
+  const site = siteFromResource(resource);
+  if (!site) return res.status(400).type('text/plain').send('bad resource');
+  const sites = getAuthorizedSites(email);
+  if (!sites.includes(site)) return res.status(403).type('text/plain').send('not authorized');
+
+  const back = new URL(String(redirect_uri));
+  if (state) back.searchParams.set('state', String(state));
+  if (decision !== 'approve') {
+    back.searchParams.set('error', 'access_denied');
+    return res.redirect(back.toString());
+  }
+  if (response_type !== 'code' || !code_challenge || (code_challenge_method || 'plain') !== 'S256') {
+    back.searchParams.set('error', 'invalid_request');
+    return res.redirect(back.toString());
+  }
+
+  const code = crypto.randomBytes(32).toString('base64url');
+  codes.set(code, {
+    client_id: String(client_id),
+    redirect_uri: String(redirect_uri),
+    code_challenge: String(code_challenge),
+    resource: String(resource).replace(/\/$/, ''),
+    email,
+    site,
+    expires_at: Date.now() + 5 * 60 * 1000,
+  });
+  back.searchParams.set('code', code);
+  res.redirect(back.toString());
+});
+
+// Token endpoint — authorization_code grant + refresh_token grant.
+app.post('/oauth/token', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const b = req.body || {};
+  if (b.grant_type === 'authorization_code') {
+    const entry = codes.get(String(b.code));
+    if (!entry) return res.status(400).json({ error: 'invalid_grant', error_description: 'unknown or used code' });
+    codes.delete(String(b.code));  // single-use
+    if (entry.expires_at < Date.now())
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'code expired' });
+    if (entry.client_id !== String(b.client_id))
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+    if (entry.redirect_uri !== String(b.redirect_uri))
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+    if (typeof b.code_verifier !== 'string' || !b.code_verifier)
+      return res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier required' });
+    const computed = crypto.createHash('sha256').update(b.code_verifier).digest('base64url');
+    if (computed !== entry.code_challenge)
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+    return res.json(issueOAuthTokens({
+      email: entry.email,
+      site: entry.site,
+      resource: entry.resource,
+      client_id: entry.client_id,
+    }));
+  }
+  if (b.grant_type === 'refresh_token') {
+    const v = verifyOurJwt(String(b.refresh_token || ''));
+    if (!v.ok) return res.status(400).json({ error: 'invalid_grant', error_description: v.reason });
+    if (v.claims.token_use !== 'refresh')
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'not a refresh token' });
+    // Re-check the user still has access (so revoking via access.json takes effect).
+    if (!getAuthorizedSites(v.claims.email).includes(v.claims.site))
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'access revoked' });
+    return res.json(issueOAuthTokens({
+      email: v.claims.email,
+      site: v.claims.site,
+      resource: v.claims.aud,
+      client_id: v.claims.client_id,
+    }));
+  }
+  return res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
 app.get('/logout', (_req, res) => {

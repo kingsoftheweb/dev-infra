@@ -36,6 +36,8 @@ services:
     environment:
       MCP_SITE: ${SLUG}
       MCP_LABEL: dev-shell-${SLUG}
+      MCP_RESOURCE: https://${MCP_DOMAIN}
+      AUTH_SERVER_URL: ${LOGIN_PUBLIC_URL:-https://login.apps.futrx.xyz}
       JWT_SECRET_FILE: /run/jwt-secret
     volumes:
       # Talks to host docker to exec into the `app` container above.

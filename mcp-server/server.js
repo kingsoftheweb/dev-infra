@@ -9,7 +9,10 @@
 //
 // Required env:
 //   MCP_SITE         docker container name (e.g. "futrx-com")
+//   MCP_RESOURCE     this server's canonical URL (e.g. https://mcp-futrx-com.apps.futrx.xyz)
+//                    — included in WWW-Authenticate and checked against token `aud`
 //   JWT_SECRET_FILE  path to the shared JWT-signing secret (default /run/jwt-secret)
+//   AUTH_SERVER_URL  base URL of the authorization server (e.g. https://login.apps.futrx.xyz)
 //
 // Optional env:
 //   PORT              listen port (default 3000)
@@ -32,6 +35,8 @@ function required(name) {
 }
 
 const SITE = required('MCP_SITE');
+const RESOURCE = (required('MCP_RESOURCE') || '').replace(/\/$/, '');
+const AUTH_SERVER_URL = (required('AUTH_SERVER_URL') || '').replace(/\/$/, '');
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DEFAULT_CWD = process.env.MCP_DEFAULT_CWD || '/home/dev/app';
 const LABEL = process.env.MCP_LABEL || `dev-shell-${SITE}`;
@@ -77,6 +82,15 @@ function verifyJwt(token) {
   }
   if (payload.site !== SITE) {
     return { ok: false, reason: `wrong site (${payload.site}, expected ${SITE})` };
+  }
+  // aud check is best-effort: legacy tokens issued via /token (pre-OAuth) don't
+  // set `aud`, so accept them. OAuth-issued tokens always set it.
+  if (payload.aud) {
+    const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    const normalized = auds.map((a) => String(a).replace(/\/$/, ''));
+    if (!normalized.includes(RESOURCE)) {
+      return { ok: false, reason: `wrong audience (${normalized.join(',')}, expected ${RESOURCE})` };
+    }
   }
   return { ok: true, claims: payload };
 }
@@ -191,6 +205,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // OAuth Protected Resource Metadata (RFC 9728). Tells clients which
+  // Authorization Server can issue tokens for this resource. This is what
+  // makes the OAuth discovery dance work — MCP clients fetch this URL the
+  // first time they get a 401.
+  if (req.method === 'GET' && req.url === '/.well-known/oauth-protected-resource') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      resource: RESOURCE,
+      authorization_servers: [AUTH_SERVER_URL],
+      bearer_methods_supported: ['header'],
+      scopes_supported: ['mcp'],
+    }));
+    return;
+  }
+
   if (req.method !== 'POST' || !['/', '/mcp'].includes(req.url)) {
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found\n');
@@ -200,7 +229,13 @@ const server = http.createServer((req, res) => {
   const token = authHeader(req);
   const v = verifyJwt(token);
   if (!v.ok) {
-    res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="mcp"' });
+    // Point the client at our protected-resource metadata; the MCP client
+    // follows that to the AS metadata and starts the OAuth dance.
+    const challenge =
+      `Bearer realm="mcp", ` +
+      `resource_metadata="${RESOURCE}/.well-known/oauth-protected-resource", ` +
+      `error="invalid_token", error_description="${v.reason}"`;
+    res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': challenge });
     res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: `Unauthorized: ${v.reason}` } }));
     return;
   }
@@ -234,5 +269,8 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.error(`MCP server listening on :${PORT} (site=${SITE}, auth=JWT HS256)`);
+  console.error(`MCP server listening on :${PORT}`);
+  console.error(`  site=${SITE}`);
+  console.error(`  resource=${RESOURCE}`);
+  console.error(`  auth_server=${AUTH_SERVER_URL}`);
 });
