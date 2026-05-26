@@ -89,6 +89,12 @@ echo "==> Creating host user '$SLUG' (uid $NEXT_UID), home $SITE_DIR, shell /bin
 useradd --create-home --home-dir "$SITE_DIR" --uid "$NEXT_UID" \
         --shell /bin/bash "$SLUG"
 
+# The user needs docker-socket access so the forced-command wrapper can run
+# `docker exec`. The only thing they can do as the docker group is exactly
+# what their authorized_keys forced command lets them — they can't get an
+# interactive host shell (no PTY, no command override). Container is the jail.
+usermod -aG docker "$SLUG"
+
 # -------- ssh keys -------------------------------------------------------
 install -d -o "$SLUG" -g "$SLUG" -m 700 "$SITE_DIR/.ssh"
 
