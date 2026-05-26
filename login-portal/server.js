@@ -199,6 +199,21 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);  // honor X-Forwarded-* from Caddy
 app.use(express.urlencoded({ extended: false }));
 
+// Request log: method, path, status, duration, any 'session' cookie status.
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  const sessionCookie = getSignedCookie(req, 'session');
+  const stateCookie = getSignedCookie(req, 'oauth_state');
+  res.on('finish', () => {
+    console.error(
+      `[${req.method}] ${req.originalUrl} → ${res.statusCode} (${Date.now()-t0}ms) ` +
+      `session=${sessionCookie ? `<${sessionCookie}>` : '<none>'} ` +
+      `state=${stateCookie ? '<set>' : '<none>'}`
+    );
+  });
+  next();
+});
+
 app.get('/health', (_req, res) => res.type('text/plain').send('ok\n'));
 
 app.get('/', (_req, res) => res.send(landingHtml()));
@@ -219,11 +234,15 @@ app.get('/auth/google', (_req, res) => {
 
 app.get('/auth/callback', async (req, res) => {
   try {
-    const { code, state } = req.query;
+    const { code, state, error } = req.query;
     const cookieState = getSignedCookie(req, 'oauth_state');
     clearCookie(res, 'oauth_state');
+    console.error(`[callback] code=${code ? 'yes' : 'no'} state=${state || '-'} cookieState=${cookieState || '-'} googleErr=${error || '-'}`);
+    if (error) {
+      return res.status(400).type('text/plain').send(`Google returned: ${error}`);
+    }
     if (!code || !state || state !== cookieState) {
-      return res.status(400).type('text/plain').send('Bad request (state mismatch).');
+      return res.status(400).type('text/plain').send(`Bad request (state mismatch). query.state=${state} cookieState=${cookieState}`);
     }
     // Exchange code for tokens
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
