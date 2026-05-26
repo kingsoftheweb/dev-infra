@@ -832,8 +832,8 @@ set -euo pipefail
 # Refuse to overwrite if any target file exists — keeps repeat runs safe.
 for f in .mcp.json .claude/launch.json .claude/proxy.js; do
   if [[ -e "$f" ]]; then
-    echo "✗ \\\$f already exists. Refusing to overwrite." >&2
-    echo "  Remove it first (rm \\\$f) if you want to reinstall." >&2
+    echo "✗ $f already exists. Refusing to overwrite." >&2
+    echo "  Remove it first (rm $f) if you want to reinstall." >&2
     exit 1
   fi
 done
