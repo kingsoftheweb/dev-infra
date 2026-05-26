@@ -7,10 +7,15 @@ set -euo pipefail
 REPO="${REPO_NAME:-app}"
 HOME_DIR=/home/dev
 
-# Ensure /home/dev/app → the actual repo subdir (first start only)
-if [[ ! -e "$HOME_DIR/app" || -L "$HOME_DIR/app" ]]; then
-  ln -sfn "$HOME_DIR/$REPO" "$HOME_DIR/app"
+# Ensure /home/dev/app is a symlink → the actual repo subdir.
+# Docker may have created an empty root-owned dir there if WORKDIR/working_dir
+# is set (we now omit both, but be defensive in case the image is older).
+if [[ -L "$HOME_DIR/app" ]]; then
+  : # already a symlink, fine
+elif [[ -d "$HOME_DIR/app" ]]; then
+  sudo rmdir "$HOME_DIR/app" 2>/dev/null || sudo rm -rf "$HOME_DIR/app"
 fi
+[[ -e "$HOME_DIR/app" ]] || ln -sfn "$HOME_DIR/$REPO" "$HOME_DIR/app"
 
 cd "$HOME_DIR/app"
 

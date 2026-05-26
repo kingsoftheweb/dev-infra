@@ -14,7 +14,9 @@ services:
         DEV_UID: ${DEV_UID}
     container_name: ${SLUG}
     hostname: ${SLUG}
-    working_dir: /home/dev/app
+    # No working_dir: Docker would otherwise auto-create /home/dev/app as a
+    # root-owned empty dir on the bind-mount, shadowing the symlink that
+    # start.sh creates. start.sh cd's into /home/dev/app itself.
     volumes:
       # Site dir → /home/dev. The /home/dev/app symlink is created at first
       # start by start.sh (it points to the cloned repo subdir).

@@ -24,7 +24,9 @@ RUN apk add --no-cache bash sudo git curl wget tini openssh-client \
  && chmod 0440 /etc/sudoers.d/dev
 
 USER dev
-WORKDIR /home/dev/app
+# No WORKDIR set: Docker would create /home/dev/app as a root-owned dir
+# *over* the bind-mount, breaking start.sh's symlink. start.sh `cd`s into
+# the right place itself.
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["/home/dev/start.sh"]
